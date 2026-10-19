@@ -1,4 +1,4 @@
-# Rock Paper Scissors Game with Arduino VENTUNO Q
+# Rock Paper Scissors TTC 2026 — Arduino VENTUNO Q
 
 A real-time Rock-Paper-Scissors game running on the Arduino UNO Q using an Edge Impulse object detection model.
 
@@ -77,8 +77,13 @@ Click on the `Rock Paper Scissors` application and then click `Run`.
 Alternatively, via SSH you can start the application using the Arduino App Lab CLI.
 
 ```bash
+arduino-app-cli app list           # confirm the app id
 arduino-app-cli app start user:rock-paper-scissors-game
 ```
+
+> After editing the app you must copy it to the board again (Step 1) and
+> restart it — App Lab runs its own copy under `/home/arduino/ArduinoApps/`,
+> so local edits are not picked up until they are transferred.
 
 Once successfully started, navigate to `http://<device-ip>:7000` in your browser and start playing!
 
@@ -90,22 +95,35 @@ Good luck!
 
 ### Game flow
 
-1. Show your hand gesture (rock, paper, or scissors) to the camera.
-2. The detection panel on the left shows what the model sees in real-time after running inference on a local object detection Edge Impulse model.
-3. Click **Play Round** — your gesture is **locked in** at that moment.
-4. The Arduino reveals its random move and the winner is shown
+The match is **continuous** — there is nothing to lock in. Press start once and rounds
+keep coming until you pause.
 
+1. Press **Start Match**. A 3-2-1 countdown runs for each round.
+2. Show your hand gesture (rock, paper, or scissors) to the camera. You can keep changing
+   it right up to the last instant.
+3. Your gesture is read **at the moment the countdown hits zero** ("shoot!"), and the
+   Arduino reveals its random move.
+4. The result is held on screen for a moment, then the next countdown starts automatically.
+5. **Pause** stops the loop after the current round; **Reset** clears the scores, history
+   and commentary.
 
+While all of this happens, the **Live Camera** panel shows the feed straight from the
+model runner with the detected bounding boxes drawn on top, plus a transparent coloured
+wash and emoji for whatever class is currently predicted — so you can see exactly what
+the model sees.
 
 ## Configuration
 
-All settings are in [python/main.py](python/main.py) at the top:
+All settings are in [python/main.py](python/main.py) at the top. Each one can also be
+overridden with an environment variable of the same name.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `CONFIDENCE_THRESHOLD` | `0.6` | Minimum confidence to accept a detection |
-| `COUNTDOWN_SECS` | `3` | Countdown duration before evaluating |
-| `RESULT_HOLD_SECS` | `3` | How long the result stays on screen |
+| `CONFIDENCE` | `0.4` | Minimum confidence to accept a detection (`CONFIDENCE_THRESHOLD`) |
+| `COUNTDOWN_SECS` | `3` | Countdown duration before the gesture is read |
+| `RESULT_HOLD_SECS` | `3.5` | How long the result stays on screen before the next round |
+| `COMMENTARY_MIN_INTERVAL` | `8` | Minimum seconds between LLM commentary lines |
+| `DEBUG_DETECTIONS` | unset | Set to `1` to log every raw detection payload |
 
 
 ### Improving the model
@@ -129,6 +147,106 @@ Want to learn more about how Edge Impulse ork? Try one of the [Edge Impulse cour
 - Check that `App.run()` is active: look for `[MODE] App runner: yes` in logs
 - Look for `[BRICK-RAW]` lines — if absent, the brick callback isn't firing
 - Ensure your model labels match `rock`, `paper`, `scissors` (lowercase)
+
+**The Live Camera panel stays black / "Waiting for the camera feed…":**
+- Look for `[CAMERA] Live preview stream active` in the logs. If you instead see
+  `[CAMERA] No preview frames yet from the model runner`, the brick is running but the
+  model runner has not sent a preview frame yet — give it a few seconds after start-up.
+- If the logs say `no camera preview support`, the installed `video_object_detection`
+  brick predates the `camera_preview` option. Update Arduino App Lab; the game still
+  works, just without the live feed.
+- The feed is served by the app itself at `/camera` (MJPEG) on the same port as the UI.
+
+**`error gathering device information while adding custom device "/dev/fastrpc-cdsp"`:**
+
+This is a platform/startup failure, not a bug in this app's code — the app never gets to
+start.
+
+On the UNO Q the object detection brick runs the **QNN** (Hexagon DSP) model runner, and
+both it and the LLM brick declare `/dev/fastrpc-cdsp` in their compose files as a plain
+`devices:` entry. Docker `stat()`s that path when it creates the container and aborts
+immediately if it is missing — there is no retry and no wait. The node only exists once
+the CDSP remote processor has finished booting its Hexagon firmware and the `fastrpc`
+driver has registered the misc device.
+
+There are two distinct reasons the node can be missing:
+
+1. **The app started before the CDSP finished booting.** This is the usual cause when the
+   app *works tethered over USB but fails when the board runs standalone*. Launching from
+   App Lab on your computer happens long after the board has settled, so the node is
+   already there. A standalone autostart unit, by contrast, only waits for Docker and the
+   `arduino-app-cli` daemon socket — neither of which says anything about CDSP readiness —
+   so it can win the race against the DSP bring-up and fail. Same board, same image, just
+   less elapsed time before the container is created.
+2. **The CDSP genuinely failed to come up.** It is known to intermittently fail at boot
+   (see [qualcomm-linux/kernel#1086](https://github.com/qualcomm-linux/kernel/issues/1086)).
+   In that case the node never appears at all for that boot.
+
+Diagnose it over SSH on the board:
+
+```bash
+ls -l /dev/fastrpc*                       # cdsp node present at all?
+for r in /sys/class/remoteproc/remoteproc*; do echo "$r $(cat $r/name) $(cat $r/state)"; done
+dmesg -T | grep -iE 'fastrpc|remoteproc|cdsp|q6v5'
+```
+
+To tell the two cases apart, look at the timestamps: if `/dev/fastrpc-cdsp` exists *now*
+and the CDSP remoteproc reports `running`, but the app failed at boot, it was the race
+(case 1). If the node is still absent and `dmesg` shows `start timed out` followed by
+`remoteproc remoteprocN: can't start rproc cdsp: -110`, the CDSP failed outright (case 2).
+In both cases `/dev/fastrpc-adsp` usually remains present, so its presence alone does not
+mean the DSP stack is healthy.
+
+Recovery, in order of least effort:
+
+1. **Reboot the board.** Because the failure is intermittent, the next boot usually
+   brings the CDSP up. Confirm with `ls -l /dev/fastrpc*` before starting the app.
+2. **Restart the CDSP remoteproc in place** (substitute the index whose `name` is `cdsp`):
+
+   ```bash
+   sudo sh -c 'echo stop  > /sys/class/remoteproc/remoteprocN/state'
+   sudo sh -c 'echo start > /sys/class/remoteproc/remoteprocN/state'
+   ls -l /dev/fastrpc*
+   ```
+
+   This only helps if the remoteproc entry exists but is wedged; it cannot create a node
+   the kernel never enumerated.
+3. Once the node is back, start the app again — no changes to the app are needed.
+
+**Fixing it permanently for standalone boots.** If you autostart the app with a systemd
+unit, make the unit wait for the device node instead of starting as soon as the App Lab
+daemon is listening. Add an `ExecStartPre` guard ahead of the existing ones:
+
+```ini
+[Service]
+ExecStartPre=/bin/sh -c 'until [ -e /dev/fastrpc-cdsp ]; do sleep 1; done'
+TimeoutStartSec=120
+```
+
+The `until … do sleep 1; done` form mirrors the guard in Arduino's own autostart examples
+and deliberately avoids `$`, which systemd would otherwise try to expand as a variable.
+`TimeoutStartSec` bounds the wait so a dead CDSP fails the unit instead of hanging boot.
+
+systemd also auto-generates a device unit for the node, so
+`After=dev-fastrpc\x2dcdsp.device` is a native alternative worth trying alongside it.
+
+Reload and verify after editing:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart <your-app>-autostart.service
+systemctl status <your-app>-autostart.service
+```
+
+The device request itself cannot be made optional from `app.yaml` — it is baked into the
+brick compose files in [`arduino/app-bricks-py`](https://github.com/arduino/app-bricks-py).
+Arduino is reworking this to use existence-tolerant `device_cgroup_rules` in
+[arduino/arduino-app-cli#635](https://github.com/arduino/arduino-app-cli/pull/635), so a
+future App Lab update should remove the need for the workaround above.
+
+If the CDSP never comes up on any boot, the Hexagon firmware may be missing; check
+`dmesg` for remoteproc firmware-load errors and for the presence of the DSP images that
+the brick mounts from `/usr/share/qcom`.
 
 **"App runner: no" in logs:**
 - The `App` class couldn't be imported. Make sure you're running via `arduino-app-cli app start`, not `python3 main.py` directly
