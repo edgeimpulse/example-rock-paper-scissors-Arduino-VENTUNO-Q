@@ -1,4 +1,4 @@
-# Rock Paper Scissors TTC 2026 — Arduino VENTUNO Q
+# Rock Paper Scissors — Arduino VENTUNO Q
 
 A real-time Rock-Paper-Scissors game running on the Arduino UNO Q using an Edge Impulse object detection model.
 
